@@ -14,6 +14,9 @@
 
 
 import os
+import ctypes
+import ctypes.util
+from itertools import chain
 from typing import Optional
 
 import torch
@@ -34,8 +37,8 @@ def train(
     batch_size: int = 16,
     num_epochs: int = 1,
     learning_rate: float = 3e-4,
-    cutoff_len: int = 256,
-    val_set_size: int = 16,
+    cutoff_len: int = 1024,
+    val_set_size: int = 0,
     quantize: bool = False,
     eval_step: int = 100,
     save_step: int = 100,
@@ -47,7 +50,52 @@ def train(
     dtype: str = "float16",
     init_lora_weights="olora",
     seed: Optional[int] = None,
+    group_texts_enabled: bool = True,
 ):
+    # Per-rank NUMA binding: bind each rank to its own NUMA node (CPU + memory)
+    local_rank = int(
+        os.environ.get("MPI_LOCALRANKID", 0) or
+        os.environ.get("LOCAL_RANK", 0) or
+        os.environ.get("PMI_RANK", 0) or 0
+    )
+    try:
+        import subprocess
+        numa_out = subprocess.check_output(["numactl", "-H"], text=True)
+        numa_cpus = {}
+        for line in numa_out.splitlines():
+            if line.startswith("node ") and "cpus:" in line:
+                parts = line.split()
+                node_id = int(parts[1])
+                cpu_start = parts.index("cpus:") + 1
+                cpus = [int(c) for c in parts[cpu_start:]]
+                numa_cpus[node_id] = cpus
+        num_nodes = len(numa_cpus)
+        if local_rank < num_nodes and numa_cpus:
+            # CPU core binding
+            os.sched_setaffinity(0, numa_cpus[local_rank])
+            # Memory binding via libnuma
+            libnuma_path = ctypes.util.find_library("numa")
+            if libnuma_path:
+                libnuma = ctypes.CDLL(libnuma_path)
+                # Set preferred NUMA node for memory allocation
+                libnuma.numa_set_preferred(local_rank)
+                # Strict membind with proper ctypes pointer handling
+                libnuma.numa_parse_nodestring.restype = ctypes.c_void_p
+                libnuma.numa_set_membind.argtypes = [ctypes.c_void_p]
+                bitmask = libnuma.numa_parse_nodestring(str(local_rank).encode())
+                if bitmask:
+                    libnuma.numa_set_membind(bitmask)
+                    # Free the bitmask
+                    libnuma.numa_bitmask_free.argtypes = [ctypes.c_void_p]
+                    libnuma.numa_bitmask_free(bitmask)
+                print(f"[Rank {local_rank}] Bound to NUMA node {local_rank} "
+                      f"(cores: {numa_cpus[local_rank][0]}-{numa_cpus[local_rank][-1]}, membind)")
+            else:
+                print(f"[Rank {local_rank}] CPU bound to NUMA node {local_rank}, "
+                      f"but libnuma not found for membind")
+    except Exception as e:
+        print(f"[Rank {local_rank}] NUMA binding failed: {e}, continuing without binding")
+
     # Set device_map to the right place when enabling DDP.
     world_size = int(os.environ.get("WORLD_SIZE", 0)) or int(os.environ.get("PMI_SIZE", 0))
     if world_size > 1 and device_map != "cpu":
@@ -75,14 +123,13 @@ def train(
     def tokenize(prompt, add_eos_token=True):
         result = tokenizer(
             prompt,
-            truncation=True,
-            max_length=cutoff_len,
+            truncation=not group_texts_enabled,
+            max_length=cutoff_len if not group_texts_enabled else None,
             padding=False,
             return_tensors=None,
         )
         if (
             result["input_ids"][-1] != tokenizer.eos_token_id
-            and len(result["input_ids"]) < cutoff_len
             and add_eos_token
         ):
             result["input_ids"].append(tokenizer.eos_token_id)
@@ -97,6 +144,16 @@ def train(
         tokenized_full_prompt = tokenize(full_prompt)
         return tokenized_full_prompt
 
+    # Concatenate all texts and split into chunks of cutoff_len.
+    def group_texts(examples):
+        concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
+        total_length = len(concatenated_examples[list(examples.keys())[-1]])
+        result = {
+            k: [t[i : i + cutoff_len] for i in range(0, total_length, cutoff_len)]
+            for k, t in concatenated_examples.items()
+        }
+        return result
+
     config = LoraConfig(
         r=lora_r,
         lora_alpha=lora_alpha,
@@ -108,11 +165,20 @@ def train(
     )
     model = get_peft_model(model, config)
 
-    data = load_dataset(data_path)
+    if data_path.endswith(".json") or data_path.endswith(".jsonl"):
+        data = load_dataset("json", data_files=data_path)
+    else:
+        data = load_dataset(data_path)
 
-    train_val = data["train"].train_test_split(test_size=val_set_size, shuffle=True, seed=42)
-    train_data = train_val["train"].shuffle().map(generate_and_tokenize_prompt)
-    val_data = train_val["test"].shuffle().map(generate_and_tokenize_prompt)
+    if val_set_size > 0:
+        train_val = data["train"].train_test_split(test_size=val_set_size, shuffle=True, seed=42)
+        train_data = train_val["train"].shuffle().map(generate_and_tokenize_prompt)
+        val_data = train_val["test"].shuffle().map(generate_and_tokenize_prompt)
+    else:
+        train_data = data["train"].map(generate_and_tokenize_prompt)
+        if group_texts_enabled:
+            train_data = train_data.map(group_texts, batched=True)
+        val_data = None
 
     trainer = transformers.Trainer(
         model=model,
@@ -125,13 +191,13 @@ def train(
             learning_rate=learning_rate,
             logging_steps=100,
             optim="adamw_torch",
-            eval_strategy="steps",
+            eval_strategy="steps" if val_set_size > 0 else "no",
             save_strategy="steps",
-            eval_steps=eval_step,
+            eval_steps=eval_step if val_set_size > 0 else None,
             save_steps=save_step,
             output_dir=output_dir,
             save_total_limit=3,
-            load_best_model_at_end=True,
+            load_best_model_at_end=True if val_set_size > 0 else False,
             ddp_find_unused_parameters=False if world_size > 1 else None,
         ),
         data_collator=transformers.DataCollatorForSeq2Seq(
@@ -160,8 +226,8 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--num_epochs", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=3e-4)
-    parser.add_argument("--cutoff_len", type=int, default=256)
-    parser.add_argument("--val_set_size", type=int, default=16)
+    parser.add_argument("--cutoff_len", type=int, default=1024)
+    parser.add_argument("--val_set_size", type=int, default=0)
     parser.add_argument("--quantize", action="store_true")
     parser.add_argument("--eval_step", type=int, default=100)
     parser.add_argument("--save_step", type=int, default=100)
@@ -173,6 +239,8 @@ if __name__ == "__main__":
     parser.add_argument("--dtype", type=str, default="float16")
     parser.add_argument("--init_lora_weights", type=str, default="olora")
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--group_texts", action="store_true", default=True)
+    parser.add_argument("--no_group_texts", action="store_false", dest="group_texts")
 
     args = parser.parse_args()
 
@@ -196,4 +264,5 @@ if __name__ == "__main__":
         dtype=args.dtype,
         init_lora_weights=args.init_lora_weights,
         seed=args.seed,
+        group_texts_enabled=args.group_texts,
     )
