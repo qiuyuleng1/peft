@@ -43,6 +43,7 @@ usage() {
   echo "  --accelerate_config     Path to accelerate config yaml (default: fine-tune/cpu_config.yaml)"
   echo "  --group_texts           Enable group_texts concatenation (default)"
   echo "  --no_group_texts        Disable group_texts concatenation"
+  echo "  --max_steps             Max training steps, -1 for full epoch (default: -1)"
 }
 
 has_argument() {
@@ -138,6 +139,10 @@ handle_options() {
       --group_texts)
         group_texts="--group_texts"
         ;;
+      --max_steps*)
+        max_steps=$(extract_argument "$@")
+        shift
+        ;;
       *)
         echo "Invalid option: $1" >&2
         usage
@@ -176,4 +181,5 @@ accelerate launch --config_file "$accelerate_config" "$file" \
   --dtype "$model_dtype" \
   --device_map "$device" \
   $quantize \
-  $group_texts
+  $group_texts \
+  --max_steps "$max_steps"

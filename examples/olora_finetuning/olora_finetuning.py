@@ -51,6 +51,7 @@ def train(
     init_lora_weights="olora",
     seed: Optional[int] = None,
     group_texts_enabled: bool = True,
+    max_steps: int = -1,
 ):
     # Per-rank NUMA binding: bind each rank to its own NUMA node (CPU + memory)
     local_rank = int(
@@ -188,6 +189,7 @@ def train(
             per_device_train_batch_size=batch_size,
             warmup_steps=100,
             num_train_epochs=num_epochs,
+            max_steps=max_steps,
             learning_rate=learning_rate,
             logging_steps=100,
             optim="adamw_torch",
@@ -205,6 +207,20 @@ def train(
         ),
     )
     trainer.train()
+
+    # Log peak memory (RSS) from /proc/self/status
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmHWM:"):
+                    peak_kb = int(line.split()[1])
+                    peak_mb = peak_kb / 1024
+                    peak_gb = peak_mb / 1024
+                    print(f"[MEMORY] Rank {local_rank} peak RSS: {peak_mb:.0f} MB ({peak_gb:.1f} GB)")
+                    break
+    except Exception:
+        pass
+
     model.save_pretrained(output_dir)
 
 
@@ -241,6 +257,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--group_texts", action="store_true", default=True)
     parser.add_argument("--no_group_texts", action="store_false", dest="group_texts")
+    parser.add_argument("--max_steps", type=int, default=-1)
 
     args = parser.parse_args()
 
@@ -265,4 +282,5 @@ if __name__ == "__main__":
         init_lora_weights=args.init_lora_weights,
         seed=args.seed,
         group_texts_enabled=args.group_texts,
+        max_steps=args.max_steps,
     )
