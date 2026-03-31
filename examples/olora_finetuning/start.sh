@@ -39,7 +39,6 @@ for model in "${MODELS[@]}"; do
         bash run_lora.sh -m "$model" \
           --data_path /home/finetune_code/alpaca_data.json \
           --model_dtype bfloat16 \
-          --accelerate_config /root/fine-tune/cpu_config.yaml \
           --cutoff_len "$cutoff" \
           --batch_size "$bs" \
           --max_steps "$MAX_STEPS" \

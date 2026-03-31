@@ -1,0 +1,12 @@
+Traceback (most recent call last):
+  File "/opt/venv/bin/accelerate", line 3, in <module>
+    from accelerate.commands.accelerate_cli import main
+  File "/opt/venv/lib/python3.12/site-packages/accelerate/__init__.py", line 16, in <module>
+    from .accelerator import Accelerator
+  File "/opt/venv/lib/python3.12/site-packages/accelerate/accelerator.py", line 32, in <module>
+    import torch
+  File "/opt/venv/lib/python3.12/site-packages/torch/__init__.py", line 431, in <module>
+    from torch._C import *  # noqa: F403
+    ^^^^^^^^^^^^^^^^^^^^^^
+  File "<frozen importlib._bootstrap>", line 463, in _lock_unlock_module
+KeyboardInterrupt

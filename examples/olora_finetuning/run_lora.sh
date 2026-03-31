@@ -17,7 +17,6 @@ lora_dropout=0.05
 init_lora_weights="gaussian"
 seed=42
 quantize=""
-accelerate_config="fine-tune/cpu_config.yaml"
 group_texts="--group_texts"
 
 usage() {
@@ -40,7 +39,6 @@ usage() {
   echo "  --init_lora_weights     LoRA init method [gaussian, olora, etc.] (default: gaussian)"
   echo "  --seed                  Random seed (default: 42)"
   echo "  --quantize              Enable 4-bit quantization"
-  echo "  --accelerate_config     Path to accelerate config yaml (default: fine-tune/cpu_config.yaml)"
   echo "  --group_texts           Enable group_texts concatenation (default)"
   echo "  --no_group_texts        Disable group_texts concatenation"
   echo "  --max_steps             Max training steps, -1 for full epoch (default: -1)"
@@ -129,10 +127,6 @@ handle_options() {
       --quantize)
         quantize="--quantize"
         ;;
-      --accelerate_config*)
-        accelerate_config=$(extract_argument "$@")
-        shift
-        ;;
       --no_group_texts)
         group_texts="--no_group_texts"
         ;;
@@ -163,6 +157,41 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 file="${SCRIPT_DIR}/olora_finetuning.py"
+
+# Auto-generate accelerate config (always, based on current machine)
+num_nodes=$(lscpu | grep -oP 'NUMA node\(s\):\s+\K\d+' || echo 1)
+
+auto_hostfile="${SCRIPT_DIR}/.auto_hostfile"
+: > "$auto_hostfile"
+for ((i=0; i<num_nodes; i++)); do
+  echo "127.0.0.1" >> "$auto_hostfile"
+done
+
+auto_config="${SCRIPT_DIR}/.auto_cpu_config.yaml"
+cat > "$auto_config" <<EOF
+compute_environment: LOCAL_MACHINE
+debug: false
+distributed_type: MULTI_CPU
+enable_cpu_affinity: false
+machine_rank: 0
+main_process_ip: 127.0.0.1
+main_process_port: 29500
+main_training_function: main
+mixed_precision: 'bf16'
+mpirun_config:
+  mpirun_ccl: '0'
+  mpirun_hostfile: "${auto_hostfile}"
+num_machines: 1
+num_processes: ${num_nodes}
+rdzv_backend: static
+same_network: true
+tpu_env: []
+tpu_use_cluster: false
+tpu_use_sudo: false
+use_cpu: true
+EOF
+accelerate_config="$auto_config"
+echo "[INFO] accelerate config: num_processes=${num_nodes}, hostfile=${auto_hostfile}"
 
 accelerate launch --config_file "$accelerate_config" "$file" \
   --base_model "$model_id" \
