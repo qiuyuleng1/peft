@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import gc
 import os
 import ctypes
 import ctypes.util
@@ -22,12 +23,155 @@ from typing import Optional
 import torch
 import transformers
 from datasets import load_dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, set_seed
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, set_seed, TrainerCallback
 
 from peft import (
     LoraConfig,
     get_peft_model,
 )
+
+
+class MemoryLoggingCallback(TrainerCallback):
+    """Log peak RSS every `log_every_n_steps` training steps."""
+
+    def __init__(self, local_rank, log_every_n_steps=100):
+        self.local_rank = local_rank
+        self.log_every_n_steps = log_every_n_steps
+
+    def _log_peak_rss(self, step_label):
+        try:
+            with open("/proc/self/status") as f:
+                for line in f:
+                    if line.startswith("VmHWM:"):
+                        peak_kb = int(line.split()[1])
+                        peak_mb = peak_kb / 1024
+                        peak_gb = peak_mb / 1024
+                        print(f"[MEMORY] Rank {self.local_rank} {step_label} peak RSS: {peak_mb:.0f} MB ({peak_gb:.1f} GB)", flush=True)
+                        break
+        except Exception:
+            pass
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step % self.log_every_n_steps == 0:
+            self._log_peak_rss(f"step {state.global_step}")
+
+    def on_train_end(self, args, state, control, **kwargs):
+        self._log_peak_rss("final")
+
+
+class StepTimingCallback(TrainerCallback):
+    """Diagnose exactly where slow steps spend time + GC monitoring."""
+
+    def __init__(self, local_rank, trainer_ref=None, log_every_n_steps=10):
+        self.local_rank = local_rank
+        self.log_every_n_steps = log_every_n_steps
+        self._step_start = None
+        self._step_times = []
+        self._gc_count_at_step_start = 0
+        self._trainer_ref = trainer_ref
+
+    def on_step_begin(self, args, state, control, **kwargs):
+        import time
+        self._step_start = time.monotonic()
+        self._gc_count_at_step_start = sum(gc.get_stats()[i]["collections"] for i in range(3))
+
+    def on_step_end(self, args, state, control, **kwargs):
+        import time
+        if self._step_start is None:
+            return
+        elapsed = time.monotonic() - self._step_start
+        self._step_times.append(elapsed)
+
+        gc_count_now = sum(gc.get_stats()[i]["collections"] for i in range(3))
+        gc_happened = gc_count_now - self._gc_count_at_step_start
+
+        if self.local_rank == 0:
+            gc_str = f" GC={gc_happened}" if gc_happened > 0 else ""
+            fwd_bwd = ""
+            if self._trainer_ref and hasattr(self._trainer_ref, '_diag_fwd'):
+                fwd = self._trainer_ref._diag_fwd
+                bwd = self._trainer_ref._diag_bwd
+                op = self._trainer_ref._diag_optim
+                other = elapsed - fwd - bwd - op
+                fwd_bwd = f" fwd={fwd:.2f}s bwd={bwd:.2f}s optim={op:.2f}s other={other:.2f}s"
+            print(f"[DIAG] step {state.global_step}: total={elapsed:.2f}s{fwd_bwd}{gc_str}",
+                  flush=True)
+
+        if state.global_step % self.log_every_n_steps == 0 and self._step_times:
+            recent = self._step_times[-self.log_every_n_steps:]
+            avg = sum(recent) / len(recent)
+            mn = min(recent)
+            mx = max(recent)
+            print(f"[TIMING] Rank {self.local_rank} step {state.global_step}: "
+                  f"last {len(recent)} steps avg={avg:.2f}s min={mn:.2f}s max={mx:.2f}s",
+                  flush=True)
+
+
+class DiagTrainer(transformers.Trainer):
+    """Subclass Trainer to measure forward+backward vs optimizer vs data loading time."""
+
+    def __init__(self, *args, diag_rank=0, fixed_batch_test=False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._diag_rank = diag_rank
+        self._diag_fwd_bwd = 0
+        self._diag_fwd = 0
+        self._diag_bwd = 0
+        self._diag_optim = 0
+        self._fixed_batch_test = fixed_batch_test
+        self._cached_batch = None
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        import time
+
+        # Fixed batch test: cache first batch, reuse for all steps
+        if self._fixed_batch_test:
+            if self._cached_batch is None:
+                self._cached_batch = {k: v.clone() for k, v in inputs.items()}
+            else:
+                inputs = {k: v.clone() for k, v in self._cached_batch.items()}
+
+        model.train()
+        inputs = self._prepare_inputs(inputs)
+
+        # Forward
+        t0 = time.monotonic()
+        with self.compute_loss_context_manager():
+            loss = self.compute_loss(model, inputs, num_items_in_batch=num_items_in_batch)
+        del inputs
+        if self.args.n_gpu > 1:
+            loss = loss.mean()
+        if num_items_in_batch is None and self.compute_loss_func is None:
+            loss = loss / self.current_gradient_accumulation_steps
+        self._diag_fwd = time.monotonic() - t0
+
+        # Backward (includes DDP allreduce)
+        t1 = time.monotonic()
+        self.accelerator.backward(loss)
+        self._diag_bwd = time.monotonic() - t1
+
+        self._diag_fwd_bwd = self._diag_fwd + self._diag_bwd
+        return loss.detach()
+
+    def _inner_training_loop(self, *args, **kwargs):
+        # Wrap optimizer.step to time it - but optimizer is created inside
+        # super()._inner_training_loop, so we patch create_optimizer instead
+        original_create_optimizer = self.create_optimizer
+
+        def patched_create_optimizer():
+            original_create_optimizer()
+            import time
+            original_step = self.optimizer.step
+
+            def timed_step(*a, **kw):
+                t0 = time.monotonic()
+                result = original_step(*a, **kw)
+                self._diag_optim = time.monotonic() - t0
+                return result
+
+            self.optimizer.step = timed_step
+
+        self.create_optimizer = patched_create_optimizer
+        return super()._inner_training_loop(*args, **kwargs)
 
 
 def train(
@@ -52,50 +196,43 @@ def train(
     seed: Optional[int] = None,
     group_texts_enabled: bool = True,
     max_steps: int = -1,
+    fixed_batch_test: bool = False,
+    use_torch_compile: bool = False,
 ):
-    # Per-rank NUMA binding: bind each rank to its own NUMA node (CPU + memory)
+    # Per-rank NUMA binding: 43 physical cores per rank (no HT)
     local_rank = int(
         os.environ.get("MPI_LOCALRANKID", 0) or
         os.environ.get("LOCAL_RANK", 0) or
         os.environ.get("PMI_RANK", 0) or 0
     )
-    try:
-        import subprocess
-        numa_out = subprocess.check_output(["numactl", "-H"], text=True)
-        numa_cpus = {}
-        for line in numa_out.splitlines():
-            if line.startswith("node ") and "cpus:" in line:
-                parts = line.split()
-                node_id = int(parts[1])
-                cpu_start = parts.index("cpus:") + 1
-                cpus = [int(c) for c in parts[cpu_start:]]
-                numa_cpus[node_id] = cpus
-        num_nodes = len(numa_cpus)
-        if local_rank < num_nodes and numa_cpus:
-            # CPU core binding
-            os.sched_setaffinity(0, numa_cpus[local_rank])
-            # Memory binding via libnuma
+    NUMA_CPUS = {
+        0: list(range(0, 43)),
+        1: list(range(43, 86)),
+        2: list(range(86, 129)),
+        3: list(range(129, 172)),
+        4: list(range(172, 215)),
+        5: list(range(215, 258)),
+        6: list(range(258, 301)),
+        7: list(range(301, 344)),
+    }
+    if local_rank in NUMA_CPUS:
+        os.sched_setaffinity(0, NUMA_CPUS[local_rank])
+        try:
             libnuma_path = ctypes.util.find_library("numa")
             if libnuma_path:
                 libnuma = ctypes.CDLL(libnuma_path)
-                # Set preferred NUMA node for memory allocation
                 libnuma.numa_set_preferred(local_rank)
-                # Strict membind with proper ctypes pointer handling
                 libnuma.numa_parse_nodestring.restype = ctypes.c_void_p
                 libnuma.numa_set_membind.argtypes = [ctypes.c_void_p]
                 bitmask = libnuma.numa_parse_nodestring(str(local_rank).encode())
                 if bitmask:
                     libnuma.numa_set_membind(bitmask)
-                    # Free the bitmask
                     libnuma.numa_bitmask_free.argtypes = [ctypes.c_void_p]
                     libnuma.numa_bitmask_free(bitmask)
-                print(f"[Rank {local_rank}] Bound to NUMA node {local_rank} "
-                      f"(cores: {numa_cpus[local_rank][0]}-{numa_cpus[local_rank][-1]}, membind)")
-            else:
-                print(f"[Rank {local_rank}] CPU bound to NUMA node {local_rank}, "
-                      f"but libnuma not found for membind")
-    except Exception as e:
-        print(f"[Rank {local_rank}] NUMA binding failed: {e}, continuing without binding")
+            print(f"[Rank {local_rank}] Bound to NUMA node {local_rank} "
+                  f"(43 cores, membind)", flush=True)
+        except Exception as e:
+            print(f"[Rank {local_rank}] NUMA membind failed: {e}", flush=True)
 
     # Set device_map to the right place when enabling DDP.
     world_size = int(os.environ.get("WORLD_SIZE", 0)) or int(os.environ.get("PMI_SIZE", 0))
@@ -166,6 +303,10 @@ def train(
     )
     model = get_peft_model(model, config)
 
+    if use_torch_compile:
+        print(f"[Rank {local_rank}] Applying torch.compile...", flush=True)
+        model = torch.compile(model)
+
     if data_path.endswith(".json") or data_path.endswith(".jsonl"):
         data = load_dataset("json", data_files=data_path)
     else:
@@ -181,10 +322,22 @@ def train(
             train_data = train_data.map(group_texts, batched=True)
         val_data = None
 
-    trainer = transformers.Trainer(
+    # Keep only model-relevant columns
+    keep_cols = {"input_ids", "attention_mask", "labels"}
+    remove_cols = [c for c in train_data.column_names if c not in keep_cols]
+    if remove_cols:
+        train_data = train_data.remove_columns(remove_cols)
+
+    memory_cb = MemoryLoggingCallback(local_rank, log_every_n_steps=100)
+    timing_cb = StepTimingCallback(local_rank, log_every_n_steps=10)
+
+    trainer = DiagTrainer(
         model=model,
         train_dataset=train_data,
         eval_dataset=val_data,
+        callbacks=[memory_cb, timing_cb],
+        diag_rank=local_rank,
+        fixed_batch_test=fixed_batch_test,
         args=transformers.TrainingArguments(
             per_device_train_batch_size=batch_size,
             warmup_steps=100,
@@ -201,25 +354,17 @@ def train(
             save_total_limit=3,
             load_best_model_at_end=True if val_set_size > 0 else False,
             ddp_find_unused_parameters=False if world_size > 1 else None,
+            dataloader_pin_memory=False,
+            remove_unused_columns=False,
         ),
         data_collator=transformers.DataCollatorForSeq2Seq(
             tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
         ),
     )
+    timing_cb._trainer_ref = trainer
+    gc.disable()
     trainer.train()
-
-    # Log peak memory (RSS) from /proc/self/status
-    try:
-        with open("/proc/self/status") as f:
-            for line in f:
-                if line.startswith("VmHWM:"):
-                    peak_kb = int(line.split()[1])
-                    peak_mb = peak_kb / 1024
-                    peak_gb = peak_mb / 1024
-                    print(f"[MEMORY] Rank {local_rank} peak RSS: {peak_mb:.0f} MB ({peak_gb:.1f} GB)")
-                    break
-    except Exception:
-        pass
+    gc.enable()
 
     model.save_pretrained(output_dir)
 
@@ -258,6 +403,8 @@ if __name__ == "__main__":
     parser.add_argument("--group_texts", action="store_true", default=True)
     parser.add_argument("--no_group_texts", action="store_false", dest="group_texts")
     parser.add_argument("--max_steps", type=int, default=-1)
+    parser.add_argument("--fixed_batch_test", action="store_true", help="Reuse first batch for all steps (perf diagnosis)")
+    parser.add_argument("--torch_compile", action="store_true", help="Use torch.compile for operator fusion")
 
     args = parser.parse_args()
 
@@ -283,4 +430,6 @@ if __name__ == "__main__":
         seed=args.seed,
         group_texts_enabled=args.group_texts,
         max_steps=args.max_steps,
+        fixed_batch_test=args.fixed_batch_test,
+        use_torch_compile=args.torch_compile,
     )

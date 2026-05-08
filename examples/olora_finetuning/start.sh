@@ -10,6 +10,7 @@ BATCH_SIZES=(16 4)
 # GROUP_TEXTS_OPTS=("--group_texts" "--no_group_texts")
 GROUP_TEXTS_OPTS=("--group_texts")
 MAX_STEPS=4
+NUM_EPOCHS=20
 
 LOG_DIR="logs"
 mkdir -p "$LOG_DIR"
@@ -41,6 +42,7 @@ for model in "${MODELS[@]}"; do
           --model_dtype bfloat16 \
           --cutoff_len "$cutoff" \
           --batch_size "$bs" \
+          --num_epochs "$NUM_EPOCHS" \
           --max_steps "$MAX_STEPS" \
           $gt \
           > "$log_file" 2>&1

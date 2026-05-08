@@ -18,6 +18,7 @@ init_lora_weights="gaussian"
 seed=42
 quantize=""
 group_texts="--group_texts"
+fixed_batch_test=""
 
 usage() {
   echo "Usage: $0 [OPTIONS]"
@@ -137,6 +138,9 @@ handle_options() {
         max_steps=$(extract_argument "$@")
         shift
         ;;
+      --fixed_batch_test)
+        fixed_batch_test="--fixed_batch_test"
+        ;;
       *)
         echo "Invalid option: $1" >&2
         usage
@@ -193,7 +197,11 @@ EOF
 accelerate_config="$auto_config"
 echo "[INFO] accelerate config: num_processes=${num_nodes}, hostfile=${auto_hostfile}"
 
-accelerate launch --config_file "$accelerate_config" "$file" \
+# Let Python sched_setaffinity handle CPU binding, disable OMP override
+export KMP_AFFINITY=disabled
+export KMP_BLOCKTIME=1
+
+accelerate launch --config_file "$accelerate_config" --num_cpu_threads_per_process 43 "$file" \
   --base_model "$model_id" \
   --data_path "$data_path" \
   --output_dir "$output_dir" \
@@ -211,4 +219,6 @@ accelerate launch --config_file "$accelerate_config" "$file" \
   --device_map "$device" \
   $quantize \
   $group_texts \
-  --max_steps "$max_steps"
+  $fixed_batch_test \
+  --max_steps "$max_steps" \
+  --torch_compile
